@@ -1,5 +1,4 @@
-# Regime-Shift: Macro-Aware Tactical Asset Allocation Engine
-
+# Regime-Shift Detection using Hidden Markov Models
 A regime-aware portfolio engine that detects whether the market is in a **Bull**, **Bear**,
 or **Crisis** state using a Hidden Markov Model, then reallocates between stocks, gold, and
 bonds using convex optimization (`cvxpy`) — validated with a strict walk-forward harness so
@@ -29,29 +28,25 @@ entirely and is treated identically to the stocks/gold legs everywhere in the pi
 |---|---|
 | `Regime_Shift_Capstone.ipynb` | **Main deliverable.** Full pipeline top to bottom: data → features → regime detection → optimization → backtest → results. |
 | `pipeline.py` | Same logic as reusable functions, if you'd rather import it from your own script than use the notebook. |
-| `run_all.py` | Command-line runner that calls `pipeline.py` and saves all figures/CSVs to `figures/`. |
-| `figures/` | PNGs + CSVs from a run (regime overlays, equity curves, transition matrix, performance summary). |
+| `code.py` | Command-line runner that calls `pipeline.py` and saves all figures/CSVs to `figures/`. |
+| `outputs/` | PNGs + CSVs from a run (regime overlays, equity curves, transition matrix, performance summary). |
 
 ## How to run it
 
-### Option A — Notebook (recommended)
+### Option A — Notebook
 ```bash
 pip install numpy pandas matplotlib scikit-learn hmmlearn cvxpy yfinance jupyter
-jupyter notebook Regime_Shift_Capstone.ipynb
+jupyter notebook Regime_Shift_Notebook.ipynb
 # Kernel -> Restart & Run All
 ```
 
 ### Option B — Script
 ```bash
 pip install numpy pandas matplotlib scikit-learn hmmlearn cvxpy yfinance
-python run_all.py
+python code.py
 ```
 Outputs land in `figures/`: regime overlays, equity curve, weight-over-time chart, the
 transition matrix, and `performance_summary.csv`.
-
-`get_data()` requires a live `yfinance` pull and does not fall back to fake data — if it
-fails (bad ticker, connectivity, Yahoo Finance rate-limiting), fix the underlying issue and
-re-run rather than getting silently substituted results.
 
 ## Key decisions
 
@@ -120,7 +115,3 @@ much the strategy is actually trading.
 `get_data()` pulls live prices, so results will shift slightly run to run as new trading days
 are added, and Yahoo Finance occasionally revises historical prints. The HMM's `random_state`
 is fixed (`RNG_SEED = 42`) so, given the same price history, regime labeling is deterministic.
-
-## Tech stack
-Python 3.9+, `numpy`, `pandas`, `matplotlib`, `yfinance`, `scipy`, `hmmlearn`, `cvxpy`,
-`scikit-learn`.
