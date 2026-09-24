@@ -1,0 +1,7 @@
+labels,regime,days,share_of_days,next_1m_vol,next_1m_return
+raw,Bull,1154,0.4209,0.1095,0.0079
+raw,Bear,1077,0.3928,0.1548,0.0086
+raw,Crisis,511,0.1864,0.1924,0.0153
+smoothed,Bull,1167,0.4256,0.1148,0.0077
+smoothed,Bear,1036,0.3778,0.1574,0.0067
+smoothed,Crisis,539,0.1966,0.1751,0.0191

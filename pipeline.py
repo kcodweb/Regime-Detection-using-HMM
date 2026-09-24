@@ -5,27 +5,38 @@ Full pipeline: data -> features -> HMM regime detection -> walk-forward
 validation -> convex portfolio optimization -> cost-aware backtest -> results.
 
 Data: Nifty 50 (stocks), Gold futures (gold), a 7-10Y Treasury bond ETF
-(bonds), and India VIX, all pulled live via yfinance.
+(bonds) and India VIX, pulled via yfinance. The two USD-quoted legs are
+converted to INR so the whole portfolio is measured in one currency.
 """
+
+from collections import namedtuple
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 RNG_SEED = 42
+ASSETS = ["stocks", "gold", "bonds"]
+REGIMES = ["Bull", "Bear", "Crisis"]
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+SNAPSHOT = DATA_DIR / "raw_prices.csv"
 
 
 # ---------------------------------------------------------------------------
 # PHASE 1: Get and understand your data
 # ---------------------------------------------------------------------------
 TICKERS = {
-    "stocks": "^NSEI",  # Nifty 50 (NSE)
-    "gold": "GC=F",     # Gold futures
-    "bonds": "IEF",     # iShares 7-10Y Treasury Bond ETF -- a real bond PRICE series.
+    "stocks": "^NSEI",  # Nifty 50 (NSE), INR
+    "gold": "GC=F",     # Gold futures, USD/oz
+    "bonds": "IEF",     # iShares 7-10Y Treasury Bond ETF, USD -- a real bond PRICE series.
                         # (^TNX is a YIELD, not a price -- using it directly as if
                         # it were a bond price gets the sign backwards: yields rise
                         # when bond prices fall. IEF avoids that entirely.)
 }
 VIX_TICKER = "^INDIAVIX"
+FX_TICKER = "INR=X"     # INR per 1 USD
+USD_LEGS = ["gold", "bonds"]
 
 
 def _extract_close(df: pd.DataFrame) -> pd.Series:
@@ -60,50 +71,83 @@ def _extract_close(df: pd.DataFrame) -> pd.Series:
     return close
 
 
-def _try_yfinance(start="2012-01-01", end=None):
+def download_raw(start="2012-01-01", end=None) -> pd.DataFrame:
+    """Raw closes for every ticker on the union of their calendars (NaN where a market was shut)."""
     import yfinance as yf
 
-    frames = {}
-    for name, tkr in TICKERS.items():
-        df = yf.download(tkr, start=start, end=end, progress=False, auto_adjust=True)
-        frames[name] = _extract_close(df)
+    def close(tkr):
+        return _extract_close(yf.download(tkr, start=start, end=end, progress=False, auto_adjust=True))
 
+    frames = {name: close(tkr) for name, tkr in TICKERS.items()}
     try:
-        vix_df = yf.download(VIX_TICKER, start=start, end=end, progress=False, auto_adjust=True)
-        frames["vix"] = _extract_close(vix_df)
+        frames["vix"] = close(VIX_TICKER)
     except Exception:
         # fall back to VIX (US) as a volatility proxy if India VIX unavailable
-        vix_df = yf.download("^VIX", start=start, end=end, progress=False, auto_adjust=True)
-        frames["vix"] = _extract_close(vix_df)
+        frames["vix"] = close("^VIX")
+    frames["usdinr"] = close(FX_TICKER)
+    raw = pd.DataFrame(frames)
+    raw.index = pd.to_datetime(raw.index).tz_localize(None)
+    raw.index.name = "Date"
+    return raw
 
-    # Build from named Series via concat so pandas aligns on the DatetimeIndex
-    # instead of requiring identical lengths/order (as dict-of-arrays would).
-    prices = pd.concat(frames, axis=1, join="inner")
-    prices.columns = list(TICKERS.keys()) + ["vix"]
-    prices = prices.dropna()
+
+def clean_fx(fx: pd.Series, tol=0.02):
+    """
+    Yahoo's INR=X series has isolated bad prints: one-day jumps of 2-6% that
+    fully reverse the next day (e.g. late Jan 2012, 2 Nov 2023). A print
+    more than `tol` away from its centred 5-day median is replaced by that
+    median; a genuine move persists, so the median follows it and it is kept.
+
+    Applied to the FX series only. This repairs vendor errors in the P&L
+    series; it never touches the HMM's inputs, and it is deliberately NOT
+    applied to the traded assets, where big one-day moves (March 2020) are
+    real and exactly what the model needs to see.
+    """
+    med = fx.rolling(5, center=True, min_periods=3).median()
+    bad = (fx / med - 1).abs() > tol
+    return fx.where(~bad, med), bad
+
+
+def prepare_prices(raw: pd.DataFrame) -> pd.DataFrame:
+    """Align the legs on common trading days and convert the USD legs to INR."""
+    prices = raw[ASSETS + ["vix"]].dropna()
+    fx, _ = clean_fx(raw["usdinr"].dropna())
+    # FX trades on days NSE is shut and vice versa: carry the last FX print forward
+    fx = fx.reindex(fx.index.union(prices.index)).ffill().reindex(prices.index)
+    prices[USD_LEGS] = prices[USD_LEGS].mul(fx, axis=0)
+    return prices.dropna()
+
+
+def get_data(start="2012-01-01", end="2025-12-31", refresh=False):
+    """
+    Loads the committed raw snapshot (data/raw_prices.csv) so results are
+    reproducible; `refresh=True` re-downloads it from yfinance instead.
+    Raises if the download fails -- there is no synthetic fallback.
+    """
+    if refresh or not SNAPSHOT.exists():
+        raw = download_raw(start, end)
+        DATA_DIR.mkdir(exist_ok=True)
+        raw.to_csv(SNAPSHOT)
+        source = "yfinance (live)"
+    else:
+        raw = pd.read_csv(SNAPSHOT, index_col=0, parse_dates=True)
+        source = f"snapshot {SNAPSHOT.relative_to(DATA_DIR.parent).as_posix()}"
+
+    prices = prepare_prices(raw.loc[start:end])
     if prices.empty:
         raise RuntimeError("No overlapping dates across tickers after alignment")
-    return prices, "yfinance (live)"
-
-
-def get_data(start="2012-01-01", end=None):
-    """
-    Pulls real daily data via yfinance: Nifty 50 (stocks), Gold futures,
-    a 7-10Y Treasury bond ETF (bonds), and India VIX (falling back to the
-    US VIX only if India VIX is unavailable). Raises if the pull fails --
-    there is no synthetic fallback; fix connectivity/tickers and re-run
-    rather than silently substituting fake data.
-    """
-    prices, source = _try_yfinance(start, end)
-    print(f"[data] Loaded live data via {source}")
+    print(f"[data] Loaded {source}")
     print(f"[data] Range: {prices.index.min().date()} to {prices.index.max().date()} "
-          f"({len(prices)} trading days)")
+          f"({len(prices)} trading days); gold & bonds converted to INR")
     return prices, source
 
 
 # ---------------------------------------------------------------------------
 # PHASE 2: Feature engineering
 # ---------------------------------------------------------------------------
+FEATURE_COLS = ["mom_1w", "mom_1m", "mom_1q", "vol_1m", "vol_1w", "vix_level", "vix_chg_1w"]
+
+
 def build_features(prices: pd.DataFrame) -> pd.DataFrame:
     ret = np.log(prices["stocks"]).diff()
 
@@ -118,36 +162,67 @@ def build_features(prices: pd.DataFrame) -> pd.DataFrame:
     # VIX level and change (market fear proxy)
     feat["vix_level"] = prices["vix"]
     feat["vix_chg_1w"] = prices["vix"].pct_change(5)
-
-    feat["ret_1d"] = ret  # kept for optimization step, not fed to HMM directly
     return feat.dropna()
-
-
-FEATURE_COLS = ["mom_1w", "mom_1m", "mom_1q", "vol_1m", "vol_1w", "vix_level", "vix_chg_1w"]
 
 
 # ---------------------------------------------------------------------------
 # PHASE 3: HMM regime classifier
 # ---------------------------------------------------------------------------
-def fit_hmm(X_scaled: np.ndarray, n_states=3, seed=RNG_SEED):
+def fit_hmm(X_scaled: np.ndarray, n_states=3, seed=RNG_SEED, n_restarts=5):
+    """EM only finds a local optimum, so fit from several seeds and keep the best log-likelihood."""
     from hmmlearn import hmm
 
-    model = hmm.GaussianHMM(
-        n_components=n_states,
-        covariance_type="diag",
-        n_iter=200,
-        random_state=seed,
-    )
-    model.fit(X_scaled)
-    return model
+    best, best_ll = None, -np.inf
+    for k in range(n_restarts):
+        model = hmm.GaussianHMM(
+            n_components=n_states,
+            covariance_type="diag",
+            n_iter=200,
+            random_state=seed + k,
+        )
+        model.fit(X_scaled)
+        ll = model.score(X_scaled)
+        if ll > best_ll:
+            best, best_ll = model, ll
+    return best
 
 
-def label_states_by_volatility(model, X_scaled, vol_col_idx):
+def label_states_by_volatility(model, vol_col_idx):
     """Rank hidden states by mean volatility feature -> Bull (lowest) / Bear (mid) / Crisis (highest)."""
-    means = model.means_[:, vol_col_idx]
-    order = np.argsort(means)  # ascending vol
-    mapping = {order[0]: "Bull", order[1]: "Bear", order[2]: "Crisis"}
-    return mapping
+    order = np.argsort(model.means_[:, vol_col_idx])  # ascending vol
+    return {state: REGIMES[rank] for rank, state in enumerate(order)}
+
+
+def _emission_loglik(model, X):
+    """Log-density of each row of X under each state's diagonal Gaussian, shape (T, n_states)."""
+    var = np.array([np.diag(c) for c in model.covars_])
+    diff = X[:, None, :] - model.means_[None, :, :]
+    return -0.5 * (np.log(2 * np.pi * var).sum(axis=1) + (diff ** 2 / var).sum(axis=2))
+
+
+def filter_states(model, X_hist, X_new):
+    """
+    Causal state probabilities P(state_t | x_1..x_t) for each row of X_new,
+    via the forward algorithm only.
+
+    model.predict() (Viterbi) and model.predict_proba() (forward-backward)
+    both decode a whole sequence at once, so the label they give day t
+    depends on days t+1, t+2, ... in the same sequence -- lookahead inside
+    every test window. Here each day's probability is updated using that
+    day's features and nothing later. X_hist (the training window) only
+    sets the starting belief.
+    """
+    from scipy.special import logsumexp
+
+    # last row of forward-backward == filtered probability on the final training day
+    log_alpha = np.log(model.predict_proba(X_hist)[-1] + 1e-300)
+    log_trans = np.log(model.transmat_ + 1e-300)
+    out = np.empty((len(X_new), model.n_components))
+    for t, ll in enumerate(_emission_loglik(model, X_new)):
+        log_alpha = logsumexp(log_alpha[:, None] + log_trans, axis=0) + ll
+        log_alpha -= logsumexp(log_alpha)
+        out[t] = np.exp(log_alpha)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +230,23 @@ def label_states_by_volatility(model, X_scaled, vol_col_idx):
 # ---------------------------------------------------------------------------
 def walk_forward_regimes(features: pd.DataFrame, train_size=504, test_size=63, n_states=3):
     """
-    Expanding train / rolling test windows. Everything (scaler + HMM) is fit
-    ONLY on the training slice; the test slice is only ever transformed and
-    predicted on. Regime label for day t never uses data from after day t.
+    Rolling train / test windows. Everything (scaler + HMM) is fit ONLY on
+    the training slice; the test slice is only ever transformed, then
+    labelled with filtered (forward-only) probabilities, so the regime for
+    day t never uses data from after day t.
+
+    Returns (labels, probs, transition_matrices): the daily regime label, the
+    daily Bull/Bear/Crisis probabilities, and each fold's transition matrix
+    relabelled to Bull/Bear/Crisis.
     """
     from sklearn.preprocessing import StandardScaler
 
     X = features[FEATURE_COLS].values
     idx = features.index
     n = len(features)
+    vol_col_idx = FEATURE_COLS.index("vol_1m")
 
-    out_regimes = pd.Series(index=idx, dtype=object)
+    probs = pd.DataFrame(np.nan, index=idx, columns=REGIMES)
     transition_matrices = []
 
     start = 0
@@ -173,27 +254,64 @@ def walk_forward_regimes(features: pd.DataFrame, train_size=504, test_size=63, n
         train_end = start + train_size
         test_end = min(train_end + test_size, n)
 
-        X_train = X[start:train_end]
-        X_test = X[train_end:test_end]
-
-        scaler = StandardScaler().fit(X_train)          # fit on TRAIN ONLY
-        X_train_s = scaler.transform(X_train)
-        X_test_s = scaler.transform(X_test)              # transform only
+        scaler = StandardScaler().fit(X[start:train_end])   # fit on TRAIN ONLY
+        X_train_s = scaler.transform(X[start:train_end])
+        X_test_s = scaler.transform(X[train_end:test_end])   # transform only
 
         model = fit_hmm(X_train_s, n_states=n_states)
-        vol_col_idx = FEATURE_COLS.index("vol_1m")
-        mapping = label_states_by_volatility(model, X_train_s, vol_col_idx)
+        mapping = label_states_by_volatility(model, vol_col_idx)
+        order = [s for r in REGIMES for s, lab in mapping.items() if lab == r]  # state id per regime
 
-        pred_train_states = model.predict(X_train_s)  # for transition matrix bookkeeping
-        pred_test_states = model.predict(X_test_s)     # decode test window using train-fit params only
+        p = filter_states(model, X_train_s, X_test_s)
+        probs.iloc[train_end:test_end] = p[:, order]
+        transition_matrices.append(
+            pd.DataFrame(model.transmat_[np.ix_(order, order)], index=REGIMES, columns=REGIMES))
+        start += test_size  # rolling: the train window slides forward with the test window
 
-        labels = [mapping[s] for s in pred_test_states]
-        out_regimes.iloc[train_end:test_end] = labels
+    probs = probs.dropna()
+    labels = probs.idxmax(axis=1).astype(object)
+    return labels, probs, transition_matrices
 
-        transition_matrices.append(model.transmat_)
-        start += test_size  # slide forward (expanding train would use start=0 always; here rolling)
 
-    return out_regimes.dropna(), transition_matrices
+def smooth_regimes(regimes: pd.Series, window: int = 21) -> pd.Series:
+    """
+    Rolling-mode smoothing of the daily regime series: a ~1-month majority
+    vote over each day and the days before it (no future data). On a tie
+    the previous smoothed regime is kept, so a split vote doesn't cause a
+    switch -- np.unique alone would break ties alphabetically ("Bear").
+    """
+    vals = regimes.to_numpy(dtype=object)
+    out = np.empty(len(vals), dtype=object)
+    for i in range(len(vals)):
+        window_vals = vals[max(0, i - window + 1):i + 1]
+        uniq, counts = np.unique(window_vals, return_counts=True)
+        winners = uniq[counts == counts.max()]
+        if len(winners) == 1:
+            out[i] = winners[0]
+        elif i > 0 and out[i - 1] in winners:
+            out[i] = out[i - 1]
+        else:
+            out[i] = next(v for v in window_vals[::-1] if v in winners)
+    return pd.Series(out, index=regimes.index)
+
+
+def regime_diagnostics(prices: pd.DataFrame, regimes: pd.Series, horizon=21) -> pd.DataFrame:
+    """
+    Does the label say anything about what comes NEXT? Realized Nifty vol and
+    return over the following `horizon` days, grouped by the regime assigned
+    today. Uses future data on purpose -- this is evaluation, not a signal.
+    """
+    r = np.log(prices["stocks"]).diff()
+    df = pd.DataFrame({
+        "regime": regimes,
+        "fwd_vol": r.rolling(horizon).std().shift(-horizon) * np.sqrt(252),
+        "fwd_ret": r.rolling(horizon).sum().shift(-horizon),
+    }).dropna()
+    out = df.groupby("regime").agg(days=("fwd_vol", "size"),
+                                   next_1m_vol=("fwd_vol", "mean"),
+                                   next_1m_return=("fwd_ret", "mean"))
+    out["share_of_days"] = out["days"] / out["days"].sum()
+    return out.reindex(REGIMES)[["days", "share_of_days", "next_1m_vol", "next_1m_return"]]
 
 
 # ---------------------------------------------------------------------------
@@ -223,122 +341,122 @@ def optimize_weights(mu: np.ndarray, sigma: np.ndarray, regime: str) -> np.ndarr
 # ---------------------------------------------------------------------------
 # PHASE 6: Backtest with transaction costs, vs benchmarks
 # ---------------------------------------------------------------------------
-def performance_stats(returns: pd.Series) -> dict:
-    ann_ret = returns.mean() * 252
-    ann_vol = returns.std() * np.sqrt(252)
-    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
-
-    downside = returns[returns < 0]
-    down_vol = downside.std() * np.sqrt(252) if len(downside) else np.nan
-    sortino = ann_ret / down_vol if down_vol and down_vol > 0 else np.nan
-
-    equity = (1 + returns).cumprod()
-    running_max = equity.cummax()
-    drawdown = equity / running_max - 1
-    max_dd = drawdown.min()
-    calmar = ann_ret / abs(max_dd) if max_dd != 0 else np.nan
-
-    return dict(ann_return=ann_ret, ann_vol=ann_vol, sharpe=sharpe, sortino=sortino,
-                max_drawdown=max_dd, calmar=calmar)
+Backtest = namedtuple("Backtest", "net gross weights turnover")
 
 
-def smooth_regimes(regimes: pd.Series, window: int = 21) -> pd.Series:
+def asset_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily SIMPLE returns: a portfolio's return is the weighted sum of these (not of log returns)."""
+    return prices[ASSETS].pct_change().dropna()
+
+
+def simulate(rets: pd.DataFrame, targets: pd.DataFrame, cost_bps=7) -> Backtest:
     """
-    Rolling-mode smoothing of the daily regime series. The raw walk-forward
-    HMM output can legitimately flip on a noisy day-to-day basis (it's
-    decoding one day at a time); a ~1-month rolling majority vote turns
-    that into a much steadier "what regime are we actually in" signal
-    without looking at any future data (each point only uses days up to
-    and including itself).
+    Daily portfolio accounting shared by every strategy.
+
+    `targets` has a row only on rebalance days: weights decided at that day's
+    close, which earn returns from the next day on. The first row is the
+    starting allocation (no cost charged for the initial buy). Between
+    rebalances the weights drift with prices, and each rebalance pays
+    `cost_bps` on turnover = sum(|target - drifted weights|).
     """
-    vals = regimes.values
-    out = np.empty(len(vals), dtype=object)
-    for i in range(len(vals)):
-        start = max(0, i - window + 1)
-        window_vals = vals[start:i + 1]
-        uniq, counts = np.unique(window_vals, return_counts=True)
-        out[i] = uniq[np.argmax(counts)]
-    return pd.Series(out, index=regimes.index)
+    targets = targets[rets.columns]
+    dates = rets.index[rets.index >= targets.index[0]]
+    R = rets.loc[dates].values
+    is_rebal = dates.isin(targets.index)
+    tgt = targets.reindex(dates).values
+
+    w = tgt[0].astype(float)
+    gross = np.zeros(len(dates))
+    turnover = np.zeros(len(dates))
+    weights = np.empty((len(dates), len(rets.columns)))
+    weights[0] = w
+    for i in range(1, len(dates)):
+        gross[i] = w @ R[i]
+        w = w * (1 + R[i]) / (1 + gross[i])       # drift with prices
+        if is_rebal[i]:
+            turnover[i] = np.abs(tgt[i] - w).sum()
+            w = tgt[i].astype(float)
+        weights[i] = w
+
+    net = gross - turnover * cost_bps / 10000
+    s = slice(1, None)  # day 0 is the setup day, before any return is earned
+    return Backtest(net=pd.Series(net[s], index=dates[s]),
+                    gross=pd.Series(gross[s], index=dates[s]),
+                    weights=pd.DataFrame(weights[s], index=dates[s], columns=rets.columns),
+                    turnover=pd.Series(turnover[s], index=dates[s]))
 
 
-def backtest_dynamic(prices: pd.DataFrame, regimes: pd.Series, lookback=63,
-                      min_hold=21, max_hold=126, cost_bps=7):
+def dynamic_targets(rets: pd.DataFrame, regimes: pd.Series, lookback=63,
+                    min_hold=21, max_hold=126) -> pd.DataFrame:
     """
     Rebalances on regime CHANGE rather than a fixed clock:
       - `regimes` should already be smoothed (see `smooth_regimes`) -- this
         function trusts whatever series it's given as the "confirmed" regime.
       - `min_hold`: hard floor -- once rebalanced, wait at least this many
         trading days before rebalancing again, even if the (smoothed) regime
-        flips back and forth near a boundary. This bounds worst-case turnover
-        regardless of how noisy the regime series is.
+        flips back and forth near a boundary.
       - `max_hold`: safety refresh -- if we haven't rebalanced in this many
         days (regime unchanged), re-estimate mu/Sigma and re-optimize once
         anyway, so weights don't go stale during a long, calm regime.
-    This directly targets turnover: a fixed 21-day clock rebalances ~12x/year
-    regardless of whether anything changed, and even change-triggered
-    rebalancing can over-trade if the regime series itself is noisy -- the
-    `min_hold` floor is what actually caps worst-case trading frequency.
+    mu/Sigma come from the trailing `lookback` days up to and including the
+    decision day (all known at its close); the history before the first
+    out-of-sample day is available, so the strategy is live from day one.
     """
-    assets = ["stocks", "gold", "bonds"]
-    rets = np.log(prices[assets]).diff().dropna()
-    rets = rets.loc[regimes.index.intersection(rets.index)]
-    regimes = regimes.loc[rets.index]
-
-    dates = rets.index
-    weights_hist = pd.DataFrame(index=dates, columns=assets, dtype=float)
-    w_prev = np.array([1 / 3, 1 / 3, 1 / 3])
-    turnover = pd.Series(0.0, index=dates)
-    rebalance_dates = []
-
+    rows = {}
     current_regime = None
     days_since_rebal = 0
-
-    for i, d in enumerate(dates):
+    for d, regime_today in regimes.items():
         days_since_rebal += 1
-        if i >= lookback:
-            regime_today = regimes.iloc[i]
-            can_rebalance = days_since_rebal >= min_hold
-            trigger = current_regime is None or (
-                can_rebalance and (regime_today != current_regime or days_since_rebal >= max_hold)
-            )
-            if trigger:
-                window = rets.iloc[i - lookback:i]        # PAST DATA ONLY
-                mu = window.mean().values * 252
-                sigma = window.cov().values * 252
-                w_new = optimize_weights(mu, sigma, regime_today)
-                turnover.iloc[i] = np.abs(w_new - w_prev).sum()
-                w_prev = w_new
-                current_regime = regime_today
-                days_since_rebal = 0
-                rebalance_dates.append(d)
-        weights_hist.iloc[i] = w_prev
-
-    gross_ret = (weights_hist.shift(1).fillna(1 / 3) * rets).sum(axis=1)
-    cost = turnover * (cost_bps / 10000)
-    net_ret = gross_ret - cost
-    print(f"[backtest] dynamic strategy rebalanced {len(rebalance_dates)} times "
-          f"over {len(dates)} trading days "
-          f"({len(rebalance_dates) / (len(dates) / 252):.1f}/year)")
-    return net_ret, weights_hist, turnover
+        trigger = current_regime is None or (
+            days_since_rebal >= min_hold
+            and (regime_today != current_regime or days_since_rebal >= max_hold)
+        )
+        if not trigger:
+            continue
+        window = rets.loc[:d].iloc[-lookback:]          # PAST DATA ONLY
+        if len(window) < lookback:
+            continue
+        mu = window.mean().values * 252
+        sigma = window.cov().values * 252
+        rows[d] = optimize_weights(mu, sigma, regime_today)
+        current_regime = regime_today
+        days_since_rebal = 0
+    return pd.DataFrame.from_dict(rows, orient="index", columns=rets.columns)
 
 
-def backtest_static(prices: pd.DataFrame, weights: dict, rebalance_every=21, cost_bps=7):
-    assets = list(weights.keys())
-    w_target = np.array([weights[a] for a in assets])
-    rets = np.log(prices[assets]).diff().dropna()
+def backtest_dynamic(prices: pd.DataFrame, regimes: pd.Series, lookback=63,
+                     min_hold=21, max_hold=126, cost_bps=7) -> Backtest:
+    rets = asset_returns(prices)
+    targets = dynamic_targets(rets, regimes, lookback, min_hold, max_hold)
+    bt = simulate(rets.loc[:regimes.index[-1]], targets, cost_bps)
+    years = len(bt.net) / 252
+    print(f"[backtest] dynamic strategy rebalanced {len(targets)} times "
+          f"over {len(bt.net)} trading days ({len(targets) / years:.1f}/year)")
+    return bt
 
-    dates = rets.index
-    w_prev = w_target.copy()
-    turnover = pd.Series(0.0, index=dates)
-    weights_hist = pd.DataFrame(index=dates, columns=assets, dtype=float)
 
-    for i, d in enumerate(dates):
-        if i % rebalance_every == 0:
-            turnover.iloc[i] = np.abs(w_target - w_prev).sum()
-            w_prev = w_target.copy()
-        weights_hist.iloc[i] = w_prev
+def backtest_static(prices: pd.DataFrame, weights: dict, start=None, end=None,
+                    rebalance_every=21, cost_bps=7) -> Backtest:
+    """Fixed-weight benchmark: drifts with prices, reset to target every `rebalance_every` days."""
+    rets = asset_returns(prices).loc[start:end]
+    rebal_dates = rets.index[::rebalance_every]
+    targets = pd.DataFrame([weights] * len(rebal_dates), index=rebal_dates).reindex(columns=ASSETS).fillna(0.0)
+    return simulate(rets, targets, cost_bps)
 
-    gross_ret = (weights_hist.shift(1).fillna(pd.Series(w_target, index=assets)) * rets).sum(axis=1)
-    cost = turnover * (cost_bps / 10000)
-    net_ret = gross_ret - cost
-    return net_ret, weights_hist, turnover
+
+def performance_stats(returns: pd.Series, turnover: pd.Series = None) -> dict:
+    """Sharpe/Sortino use a 0% risk-free rate: fine for comparing strategies, not as absolute figures."""
+    years = len(returns) / 252
+    equity = (1 + returns).cumprod()
+    cagr = equity.iloc[-1] ** (1 / years) - 1
+    ann_mean = returns.mean() * 252
+    ann_vol = returns.std() * np.sqrt(252)
+    downside_dev = np.sqrt((np.minimum(returns, 0) ** 2).mean()) * np.sqrt(252)
+    max_dd = (equity / equity.cummax() - 1).min()
+
+    return dict(cagr=cagr, ann_vol=ann_vol,
+                sharpe=ann_mean / ann_vol if ann_vol > 0 else np.nan,
+                sortino=ann_mean / downside_dev if downside_dev > 0 else np.nan,
+                max_drawdown=max_dd,
+                calmar=cagr / abs(max_dd) if max_dd != 0 else np.nan,
+                turnover_annualized=turnover.sum() / years if turnover is not None else np.nan)
