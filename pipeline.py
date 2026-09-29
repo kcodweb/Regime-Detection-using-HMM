@@ -10,6 +10,7 @@ converted to INR so the whole portfolio is measured in one currency.
 """
 
 from collections import namedtuple
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -321,16 +322,39 @@ REGIME_GAMMA = {"Bull": 2.0, "Bear": 8.0, "Crisis": 30.0}  # risk-aversion: high
 MAX_WEIGHT = 0.70
 
 
-def optimize_weights(mu: np.ndarray, sigma: np.ndarray, regime: str) -> np.ndarray:
+def _matrix_root(sigma: np.ndarray) -> np.ndarray:
+    """R with R'R = sigma (via eigh, so a near-singular sample covariance is fine), giving w'Σw = ||Rw||²."""
+    vals, vecs = np.linalg.eigh(sigma)
+    return (vecs * np.sqrt(np.clip(vals, 0, None))).T
+
+
+@lru_cache(maxsize=None)
+def _mean_variance_problem(n: int, max_weight: float):
+    """
+    Build the QP once with cvxpy Parameters, so each rebalance only swaps in
+    new numbers instead of re-compiling the problem (~20x faster, which the
+    robustness analysis needs). sqrt(gamma) is folded into the matrix root
+    to keep the problem DPP-compliant.
+    """
+    import cvxpy as cp
+
+    w = cp.Variable(n)
+    mu = cp.Parameter(n)
+    scaled_root = cp.Parameter((n, n))   # sqrt(gamma) * R, R'R = Sigma
+    objective = cp.Maximize(mu @ w - cp.sum_squares(scaled_root @ w))   # = mu'w - gamma * w'Σw
+    constraints = [cp.sum(w) == 1, w >= 0, w <= max_weight]
+    return cp.Problem(objective, constraints), w, mu, scaled_root
+
+
+def optimize_weights(mu: np.ndarray, sigma: np.ndarray, regime: str, gammas: dict = None) -> np.ndarray:
+    """maximize mu'w - gamma * w'Σw  s.t. fully invested, long-only, w <= MAX_WEIGHT; gamma = gammas[regime]."""
     import cvxpy as cp
 
     n = len(mu)
-    w = cp.Variable(n)
-    gamma = REGIME_GAMMA[regime]
-
-    objective = cp.Maximize(mu @ w - gamma * cp.quad_form(w, cp.psd_wrap(sigma)))
-    constraints = [cp.sum(w) == 1, w >= 0, w <= MAX_WEIGHT]
-    prob = cp.Problem(objective, constraints)
+    gamma = (gammas or REGIME_GAMMA)[regime]
+    prob, w, mu_p, root_p = _mean_variance_problem(n, MAX_WEIGHT)
+    mu_p.value = np.asarray(mu, dtype=float)
+    root_p.value = np.sqrt(gamma) * _matrix_root(sigma)
     prob.solve(solver=cp.CLARABEL)
 
     if w.value is None:
@@ -338,10 +362,61 @@ def optimize_weights(mu: np.ndarray, sigma: np.ndarray, regime: str) -> np.ndarr
     return np.clip(w.value, 0, None) / np.sum(np.clip(w.value, 0, None))
 
 
+@lru_cache(maxsize=None)
+def _risk_parity_problem(n: int):
+    import cvxpy as cp
+
+    x = cp.Variable(n, pos=True)
+    root = cp.Parameter((n, n))
+    # the minimizer of 0.5 x'Σx - sum(log x), rescaled to sum to 1, gives every asset the same risk contribution
+    return cp.Problem(cp.Minimize(0.5 * cp.sum_squares(root @ x) - cp.sum(cp.log(x)))), x, root
+
+
+def risk_parity_weights(sigma: np.ndarray) -> np.ndarray:
+    """Equal-risk-contribution weights: each asset adds the same amount to portfolio variance. Needs no mu."""
+    import cvxpy as cp
+
+    prob, x, root_p = _risk_parity_problem(len(sigma))
+    root_p.value = _matrix_root(sigma)
+    prob.solve(solver=cp.CLARABEL)
+    if x.value is None:
+        return np.full(len(sigma), 1 / len(sigma))
+    return x.value / x.value.sum()
+
+
+# Allocators turn (returns so far, regime labels so far, today's regime) into
+# target weights. The backtest can run with any of them, which is how the
+# robustness analysis compares the strategy with and without regimes.
+def mean_variance(lookback=63, gammas=None):
+    """The main strategy: mean-variance on the trailing window, risk aversion set by today's regime."""
+    def allocate(past_rets, past_regimes, regime):
+        window = past_rets.iloc[-lookback:]
+        return optimize_weights(window.mean().values * 252, window.cov().values * 252, regime, gammas)
+    return allocate
+
+
+def risk_parity(lookback=63, same_regime=False):
+    """
+    Risk parity on a covariance estimate. With `same_regime=True`, Sigma comes
+    from the last `lookback` days that carried today's regime label -- using
+    the regime as a risk forecast rather than a return forecast -- falling
+    back to the plain trailing window until enough such days exist.
+    """
+    def allocate(past_rets, past_regimes, regime):
+        window = past_rets.iloc[-lookback:]
+        if same_regime:
+            days = past_regimes.index[(past_regimes == regime).to_numpy()]
+            same = past_rets.loc[past_rets.index.intersection(days)].iloc[-lookback:]
+            if len(same) == lookback:
+                window = same
+        return risk_parity_weights(window.cov().values * 252)
+    return allocate
+
+
 # ---------------------------------------------------------------------------
 # PHASE 6: Backtest with transaction costs, vs benchmarks
 # ---------------------------------------------------------------------------
-Backtest = namedtuple("Backtest", "net gross weights turnover")
+Backtest = namedtuple("Backtest", "net gross weights turnover rebalances")
 
 
 def asset_returns(prices: pd.DataFrame) -> pd.DataFrame:
@@ -357,7 +432,8 @@ def simulate(rets: pd.DataFrame, targets: pd.DataFrame, cost_bps=7) -> Backtest:
     close, which earn returns from the next day on. The first row is the
     starting allocation (no cost charged for the initial buy). Between
     rebalances the weights drift with prices, and each rebalance pays
-    `cost_bps` on turnover = sum(|target - drifted weights|).
+    `cost_bps` on turnover = sum(|target - drifted weights|). `rebalances`
+    lists every trade date, the initial allocation included.
     """
     targets = targets[rets.columns]
     dates = rets.index[rets.index >= targets.index[0]]
@@ -383,11 +459,12 @@ def simulate(rets: pd.DataFrame, targets: pd.DataFrame, cost_bps=7) -> Backtest:
     return Backtest(net=pd.Series(net[s], index=dates[s]),
                     gross=pd.Series(gross[s], index=dates[s]),
                     weights=pd.DataFrame(weights[s], index=dates[s], columns=rets.columns),
-                    turnover=pd.Series(turnover[s], index=dates[s]))
+                    turnover=pd.Series(turnover[s], index=dates[s]),
+                    rebalances=dates[is_rebal])
 
 
 def dynamic_targets(rets: pd.DataFrame, regimes: pd.Series, lookback=63,
-                    min_hold=21, max_hold=126) -> pd.DataFrame:
+                    min_hold=21, max_hold=126, allocator=None) -> pd.DataFrame:
     """
     Rebalances on regime CHANGE rather than a fixed clock:
       - `regimes` should already be smoothed (see `smooth_regimes`) -- this
@@ -398,10 +475,13 @@ def dynamic_targets(rets: pd.DataFrame, regimes: pd.Series, lookback=63,
       - `max_hold`: safety refresh -- if we haven't rebalanced in this many
         days (regime unchanged), re-estimate mu/Sigma and re-optimize once
         anyway, so weights don't go stale during a long, calm regime.
-    mu/Sigma come from the trailing `lookback` days up to and including the
-    decision day (all known at its close); the history before the first
-    out-of-sample day is available, so the strategy is live from day one.
+    The `allocator` (default: `mean_variance(lookback)`) only ever sees
+    returns and labels up to and including the decision day (all known at
+    its close); the history before the first out-of-sample day is available,
+    so the strategy is live from day one. Setting min_hold = max_hold turns
+    this into a fixed clock.
     """
+    allocator = allocator or mean_variance(lookback)
     rows = {}
     current_regime = None
     days_since_rebal = 0
@@ -413,26 +493,20 @@ def dynamic_targets(rets: pd.DataFrame, regimes: pd.Series, lookback=63,
         )
         if not trigger:
             continue
-        window = rets.loc[:d].iloc[-lookback:]          # PAST DATA ONLY
-        if len(window) < lookback:
+        past_rets = rets.loc[:d]                          # PAST DATA ONLY
+        if len(past_rets) < lookback:
             continue
-        mu = window.mean().values * 252
-        sigma = window.cov().values * 252
-        rows[d] = optimize_weights(mu, sigma, regime_today)
+        rows[d] = allocator(past_rets, regimes.loc[:d], regime_today)
         current_regime = regime_today
         days_since_rebal = 0
     return pd.DataFrame.from_dict(rows, orient="index", columns=rets.columns)
 
 
 def backtest_dynamic(prices: pd.DataFrame, regimes: pd.Series, lookback=63,
-                     min_hold=21, max_hold=126, cost_bps=7) -> Backtest:
+                     min_hold=21, max_hold=126, cost_bps=7, allocator=None) -> Backtest:
     rets = asset_returns(prices)
-    targets = dynamic_targets(rets, regimes, lookback, min_hold, max_hold)
-    bt = simulate(rets.loc[:regimes.index[-1]], targets, cost_bps)
-    years = len(bt.net) / 252
-    print(f"[backtest] dynamic strategy rebalanced {len(targets)} times "
-          f"over {len(bt.net)} trading days ({len(targets) / years:.1f}/year)")
-    return bt
+    targets = dynamic_targets(rets, regimes, lookback, min_hold, max_hold, allocator)
+    return simulate(rets.loc[:regimes.index[-1]], targets, cost_bps)
 
 
 def backtest_static(prices: pd.DataFrame, weights: dict, start=None, end=None,

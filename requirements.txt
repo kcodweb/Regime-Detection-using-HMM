@@ -7,5 +7,3 @@ hmmlearn>=0.3
 cvxpy>=1.4
 yfinance>=0.2.40
 pytest>=7.0
-# notebook only
-jupyter

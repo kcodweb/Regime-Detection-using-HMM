@@ -80,6 +80,8 @@ def main(refresh=False):
     # --- Phase 5 & 6: backtest dynamic strategy vs benchmarks ---
     print("\nRunning dynamic strategy backtest (with transaction costs)...")
     dyn = pl.backtest_dynamic(prices, wf_smoothed, lookback=63, min_hold=21, max_hold=126, cost_bps=7)
+    print(f"[backtest] dynamic strategy rebalanced {len(dyn.rebalances)} times over {len(dyn.net)} "
+          f"trading days ({len(dyn.rebalances) / (len(dyn.net) / 252):.1f}/year)")
     start, end = wf_smoothed.index[0], wf_smoothed.index[-1]
     static = pl.backtest_static(prices, {"stocks": 0.6, "bonds": 0.4}, start, end, cost_bps=7)
     eqw = pl.backtest_static(prices, {a: 1 / 3 for a in pl.ASSETS}, start, end, cost_bps=7)
