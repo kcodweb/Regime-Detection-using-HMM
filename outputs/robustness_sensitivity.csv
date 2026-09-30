@@ -1,0 +1,23 @@
+parameter,value,is_default,sharpe,cagr,max_drawdown,ew_sharpe
+HMM training window (days),252.0,False,1.3103,0.1436,-0.1337,1.3029
+HMM training window (days),504.0,True,1.1965,0.1298,-0.1499,1.3718
+HMM training window (days),756.0,False,0.8328,0.089,-0.1809,1.3913
+Smoothing window (days),1.0,False,0.8185,0.0861,-0.1629,1.3718
+Smoothing window (days),10.0,False,0.8954,0.0988,-0.1843,1.3718
+Smoothing window (days),21.0,True,1.1965,0.1298,-0.1499,1.3718
+Smoothing window (days),42.0,False,1.0861,0.1145,-0.1498,1.3718
+Min hold (days),5.0,False,1.2595,0.1379,-0.1499,1.3718
+Min hold (days),10.0,False,1.2606,0.1381,-0.1499,1.3718
+Min hold (days),21.0,True,1.1965,0.1298,-0.1499,1.3718
+Min hold (days),42.0,False,1.0665,0.111,-0.1637,1.3718
+Estimation lookback (days),42.0,False,1.2908,0.1341,-0.1409,1.3718
+Estimation lookback (days),63.0,True,1.1965,0.1298,-0.1499,1.3718
+Estimation lookback (days),126.0,False,1.1344,0.1212,-0.1548,1.3718
+Estimation lookback (days),252.0,False,1.2225,0.1273,-0.1329,1.3718
+Risk aversion (x default),0.5,False,1.1871,0.1412,-0.1401,1.3718
+Risk aversion (x default),1.0,True,1.1965,0.1298,-0.1499,1.3718
+Risk aversion (x default),2.0,False,1.1864,0.1179,-0.1463,1.3718
+Cost (bps),0.0,False,1.2185,0.1324,-0.1487,1.3741
+Cost (bps),7.0,True,1.1965,0.1298,-0.1499,1.3718
+Cost (bps),15.0,False,1.1712,0.1268,-0.1512,1.3691
+Cost (bps),30.0,False,1.1234,0.1212,-0.1537,1.3642

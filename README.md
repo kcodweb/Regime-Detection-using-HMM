@@ -1,9 +1,13 @@
 # Regime-Shift Detection using Hidden Markov Models
+[![tests](https://github.com/kcodweb/Regime-Detection-using-HMM/actions/workflows/tests.yml/badge.svg)](https://github.com/kcodweb/Regime-Detection-using-HMM/actions/workflows/tests.yml)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kcodweb/Regime-Detection-using-HMM/blob/main/Regime_Shift_Notebook.ipynb)
+
 A regime-aware portfolio engine that detects whether the Indian market is in a **Bull**,
 **Bear**, or **Crisis** state using a Hidden Markov Model, then reallocates between stocks,
 gold, and bonds using convex optimization (`cvxpy`) — validated with a strict walk-forward
 harness so the backtest can't cheat by peeking into the future (and a test suite that checks
-it doesn't).
+it doesn't), then stress-tested with ablations, a random-timing null, bootstrap intervals and
+a sensitivity analysis to see whether the result is signal or luck.
 
 ## Results
 
@@ -26,6 +30,8 @@ Out-of-sample, 23 May 2014 – 30 Dec 2025, in INR, net of 7 bps costs:
   2024 the strategy was ~3% *behind*; 2025 — ~55% average gold weight while gold rose ~74% in
   INR — put it ~8% ahead.
 - **Costs are small**: ~5 rebalances a year cost ~0.3% a year.
+- **None of these differences is statistically significant**, and the Sharpe moves a lot with
+  some design choices — see [Is the edge real?](#is-the-edge-real) below.
 - Sharpe/Sortino use a 0% risk-free rate, so compare them across rows, not with published figures.
 
 ### Do the regimes mean anything?
@@ -44,6 +50,67 @@ That matches how the optimizer uses them (regime sets risk aversion, not expecte
 it is also the cost of the approach: de-risking in Crisis gives up some of the rebound.
 
 ![Walk-forward regimes](outputs/03_regimes_overlay_walkforward.png)
+
+## Is the edge real?
+
+One backtest is one path through history. `robustness.py` runs four checks
+(`outputs/robustness_*.csv`):
+
+**1. Ablation: each method with and without the regime signal.** "Without" = one fixed
+setting, rebalanced every 21 days. Risk parity gives each asset the same risk contribution and
+needs no expected-return estimate; its regime version estimates the covariance from past days
+that carried today's regime label, i.e. it uses the regime as the risk forecast the
+diagnostics above say it is.
+
+| Strategy | CAGR | Sharpe | Max DD | Turnover / yr | Sharpe vs equal weight (95% CI) |
+|---|---|---|---|---|---|
+| **Regime mean-variance** (the strategy) | 13.0% | 1.20 | −15.0% | 3.30 | −0.18 (−0.48, +0.14) |
+| Mean-variance, fixed γ = 2 | 11.9% | 1.02 | −20.3% | 6.35 | −0.36 (−0.72, +0.02) |
+| Mean-variance, fixed γ = 8 | 10.7% | 0.96 | −15.2% | 5.93 | −0.42 (−0.74, −0.08) |
+| Mean-variance, fixed γ = 30 | 9.0% | 0.97 | −15.6% | 4.35 | −0.40 (−0.68, −0.09) |
+| **Regime risk parity** | 10.7% | 1.32 | −12.6% | 0.75 | −0.05 (−0.18, +0.09) |
+| Risk parity, trailing covariance | 10.1% | 1.29 | −12.4% | 0.93 | −0.09 (−0.22, +0.05) |
+| Equal weight | 12.2% | 1.37 | −12.5% | 0.29 | — |
+| Static 60/40 | 10.4% | 1.07 | −17.5% | 0.26 | −0.30 (−0.71, +0.15) |
+
+**2–3. Does the regime signal add value?** Sharpe differences with 95% intervals from a
+block bootstrap (2,000 resamples of ~1-month blocks), and against 500 random regime timings
+(same regime runs and lengths, shuffled order):
+
+| Comparison | ΔSharpe | 95% interval | Share of resamples / shuffles where it's not better |
+|---|---|---|---|
+| Regime mean-variance vs best fixed γ (picked in hindsight) | +0.18 | −0.16, +0.53 | 15% |
+| Regime risk parity vs trailing risk parity | +0.04 | −0.07, +0.16 | 26% |
+| Regime mean-variance vs random regime timing | +0.11 | −0.18, +0.40 | 23% |
+| Regime mean-variance vs equal weight | −0.18 | −0.48, +0.14 | 86% |
+| Regime mean-variance vs static 60/40 | +0.13 | −0.32, +0.55 | 31% |
+
+![Random regime timing](outputs/06_random_regime_null.png)
+
+**4. Sensitivity: one design choice at a time.**
+
+![Sensitivity](outputs/07_sensitivity.png)
+
+**What this says:**
+- **The regime signal helps, but not provably.** It lifts mean-variance by ~0.18 Sharpe over
+  the best fixed setting while halving turnover, and lifts risk parity a little; neither gain
+  is significant at 95%.
+- **The HMM's timing is only weakly better than random**: 23% of shuffled timings do as well.
+  A good part of the result comes from *how much* time is spent in each regime, not *when*.
+- **No significant difference from the benchmarks**: both of the strategy's intervals, against
+  equal weight and 60/40, include zero. (The fixed-γ versions are significantly *worse* than
+  equal weight.)
+- **The headline is sensitive to design choices.** Across the 22 variations, Sharpe ranges from
+  0.82 to 1.31. It moves most with the HMM training window (1.31 at one year, 0.83 at three)
+  and the smoothing window, and the default 21-day smoothing happens to be the best of the four
+  tried, so the headline is more likely optimistic than pessimistic. Only 1 of 22 variations
+  beats equal weight, by 0.01. Risk aversion and costs barely matter.
+- **Using the regime as a risk forecast works best among the regime strategies**: regime risk
+  parity has the highest Sharpe and smallest drawdown at a quarter of the turnover, though at a
+  lower CAGR, and it still doesn't beat equal weight. It was one of two fixes for the noisy
+  63-day mean decided on before looking (the other, a 12-month estimation window, changed
+  little: see the sensitivity panel), and the headline strategy was deliberately left as
+  designed rather than swapped for whichever variant looked best afterwards.
 
 ## Data
 
@@ -78,25 +145,30 @@ is cleaned — big one-day moves in the traded assets (March 2020) are real.
 
 | File | Purpose |
 |---|---|
-| `Regime_Shift_Notebook.ipynb` | **Main deliverable.** Walks through every phase top to bottom — data → features → regime detection → optimization → backtest → results — with the figures and commentary. |
-| `pipeline.py` | All of the logic, one section per phase. The notebook and `run.py` both import it. |
-| `plots.py` | The figures, shared by the notebook and `run.py`. |
-| `run.py` | Command-line runner: saves every figure and CSV to `outputs/`. |
-| `tests/test_pipeline.py` | Checks no-lookahead, portfolio accounting, smoothing, FX repair and the optimizer. |
+| `Regime_Shift_Notebook.ipynb` | **Main deliverable.** Walks through every phase top to bottom — data → features → regime detection → optimization → backtest → results → robustness — with the figures and commentary. |
+| `pipeline.py` | All of the logic, one section per phase. The notebook and both scripts import it. |
+| `robustness.py` | Ablation, random-regime null, bootstrap intervals and sensitivity analysis. |
+| `plots.py` | The figures, shared by the notebook and the scripts. |
+| `run.py` | Command-line runner for the main pipeline: saves figures 01–05 and the CSVs to `outputs/`. |
+| `tests/` | Checks no-lookahead, portfolio accounting, smoothing, FX repair, the optimizers and the robustness statistics. Run by CI on every push. |
 | `data/raw_prices.csv` | Raw price snapshot, so results reproduce exactly. |
-| `outputs/` | Regime overlays, equity curves, weights, transition matrices, regime diagnostics, performance summary. |
+| `outputs/` | Regime overlays, equity curves, weights, transition matrices, regime diagnostics, performance summary, robustness results. |
 
 ## How to run it
 
+The quickest way is the **Open in Colab** badge at the top: the notebook's first cell fetches
+the repo and installs what's missing. Locally:
+
 ```bash
 pip install -r requirements.txt
-python run.py              # uses data/raw_prices.csv
+python run.py              # main pipeline, ~1 min; uses data/raw_prices.csv
 python run.py --refresh    # re-downloads prices from yfinance first
+python robustness.py       # robustness checks, ~3 min
 pytest                     # ~20 s
 ```
 
-For the notebook: `jupyter notebook Regime_Shift_Notebook.ipynb`, then Kernel → Restart & Run
-All (run it from the repo root so it can import `pipeline.py`).
+For the notebook: `pip install jupyter`, then `jupyter notebook Regime_Shift_Notebook.ipynb` and
+Kernel → Restart & Run All from the repo root (~4 min, most of it the robustness section).
 
 ## Key decisions
 
@@ -172,15 +244,22 @@ between rebalances the weights drift with prices; and each rebalance pays 7 bps 
 brief. It's applied only when a rebalance actually fires.
 
 ## Limitations and next steps
+- **No statistically significant edge.** See [Is the edge real?](#is-the-edge-real): the
+  regime signal helps, but none of the differences clears a 95% bar, and the Sharpe moves a lot
+  with the training and smoothing windows. Treat the results as a well-tested prototype, not a
+  proven strategy.
 - **The optimizer is the weak link.** `mu` is a trailing 63-day mean, which is mostly noise, so
   mean-variance ends up chasing recent winners and hitting the 70% cap (see
-  `outputs/05_dynamic_weights.png`). Since the regimes forecast volatility, not returns, a
-  natural next step is to let them drive risk directly (volatility targeting, risk parity with
-  regime-dependent leverage) instead of feeding a noisy mean return into the optimizer.
+  `outputs/05_dynamic_weights.png`). Using the regimes for risk instead (regime risk parity)
+  gives a better Sharpe and drawdown at a lower return. The most promising next step is a
+  **cash leg**: with one, the regime's volatility forecast could scale total risk up and down
+  (volatility targeting), which a fully invested three-asset portfolio can't do.
 - **One path, one period.** 11 years is only a handful of real crises, and one of them (2025
-  gold) decides the CAGR ranking. Treat the table as evidence, not proof.
+  gold) decides the CAGR ranking. More markets or a longer history would say more than any
+  amount of resampling this one.
 - **Not tuned — on purpose.** `gamma`, windows and holding periods are the original design
-  choices; none were fitted to the backtest.
+  choices; none were fitted to the backtest. The sensitivity analysis shows what tuning would
+  have looked like — and why a tuned headline would not be trustworthy.
 
 ## Reproducing results
 `run.py` and the notebook read `data/raw_prices.csv`, and every random step is seeded

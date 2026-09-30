@@ -74,6 +74,49 @@ def equity_curves(curves: dict):
     return fig
 
 
+def null_distribution(null_sharpes, strategy_sharpe, ew_sharpe):
+    """Histogram of Sharpe ratios from shuffled regime timing, against the real timing and equal weight."""
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.hist(null_sharpes, bins=30, color="#9aa5b1", edgecolor="white")
+    share = (np.asarray(null_sharpes) >= strategy_sharpe).mean()
+    ax.axvline(strategy_sharpe, color="#1f77b4", lw=2.5,
+               label=f"HMM regime timing: {strategy_sharpe:.2f} ({share:.0%} of shuffles do as well)")
+    ax.axvline(ew_sharpe, color="#2ca02c", lw=2, ls="--", label=f"Equal weight: {ew_sharpe:.2f}")
+    ax.set_title(f"Strategy Sharpe with {len(null_sharpes)} random regime timings "
+                 "(same regime runs and lengths, shuffled order)")
+    ax.set_xlabel("Sharpe ratio (net of costs)")
+    ax.set_ylabel("Shuffles")
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    return fig
+
+
+def sensitivity_grid(sens: pd.DataFrame):
+    """One panel per design choice: strategy Sharpe as it varies, equal weight over the same dates dashed."""
+    params = list(dict.fromkeys(sens["parameter"]))
+    cols = 3
+    rows = int(np.ceil(len(params) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 3.2 * rows), sharey=True, squeeze=False)
+    for ax, param in zip(axes.flat, params):
+        d = sens[sens["parameter"] == param]
+        x = np.arange(len(d))
+        ax.plot(x, d["sharpe"], marker="o", color="#1f77b4", label="Regime strategy")
+        ax.plot(x, d["ew_sharpe"], ls="--", color="#2ca02c", label="Equal weight")
+        default = d["is_default"].to_numpy()
+        ax.scatter(x[default], d["sharpe"].to_numpy()[default], s=140, facecolors="none",
+                   edgecolors="black", zorder=3, label="Default")
+        ax.set_xticks(x, [f"{v:g}" for v in d["value"]])
+        ax.set_title(param, fontsize=10)
+        ax.grid(alpha=0.3)
+    for ax in list(axes.flat)[len(params):]:
+        ax.axis("off")
+    axes[0, 0].set_ylabel("Sharpe (net)")
+    axes[0, 0].legend(loc="lower left", fontsize=8)
+    fig.suptitle("Sensitivity: one design choice changed at a time", y=1.0)
+    fig.tight_layout()
+    return fig
+
+
 def weights_over_time(weights: pd.DataFrame, regimes: pd.Series = None):
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.stackplot(weights.index, weights.T.values, labels=weights.columns, alpha=0.85)
